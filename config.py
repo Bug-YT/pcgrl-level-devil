@@ -47,6 +47,9 @@ class Config:
 
     ema_alpha: float = 0.2
 
+    gui_enabled: bool = False
+    gui_render_every: int = 3
+
     def ensure_folders(self) -> None:
         for folder in (self.levels_folder, self.logs_folder, self.models_folder):
             Path(folder).mkdir(parents=True, exist_ok=True)
@@ -73,6 +76,8 @@ def load_config(env_path: str = ".env", argv: list[str] | None = None) -> Config
         max_attempts_per_run=int(os.getenv("MAX_ATTEMPTS_PER_RUN", 30)),
         max_steps_per_attempt=int(os.getenv("MAX_STEPS_PER_ATTEMPT", 400)),
         ema_alpha=float(os.getenv("EMA_ALPHA", 0.2)),
+        gui_enabled=_get_bool(os.getenv("GUI_ENABLED"), False),
+        gui_render_every=int(os.getenv("GUI_RENDER_EVERY", 3)),
     )
 
     parser = argparse.ArgumentParser(description="PCGRL Level Devil Pipeline V5")
@@ -88,6 +93,14 @@ def load_config(env_path: str = ".env", argv: list[str] | None = None) -> Config
     parser.add_argument("--eval-runs", type=int, dest="eval_runs")
     parser.add_argument("--max-attempts", type=int, dest="max_attempts_per_run")
     parser.add_argument("--max-steps", type=int, dest="max_steps_per_attempt")
+    parser.add_argument(
+        "--gui",
+        dest="gui_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Live-GUI (pygame) anzeigen, die Builder-Level und Player-Bewegung visualisiert",
+    )
+    parser.add_argument("--gui-render-every", type=int, dest="gui_render_every")
 
     args = parser.parse_args(argv)
     for f in fields(cfg):

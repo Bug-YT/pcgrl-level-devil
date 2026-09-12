@@ -4,3 +4,6 @@ numpy
 torch
 stable-baselines3
 gymnasium
+# Nur fuer --gui benoetigt (optionale Live-Visualisierung).
+# Falls nicht installiert, laeuft die Pipeline ohne --gui normal weiter.
+pygame

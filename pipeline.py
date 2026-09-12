@@ -31,6 +31,12 @@ from builder_env import BuilderEnv
 from player_env import PlayerEnv
 
 
+class GuiQuit(Exception):
+    """Wird ausgeloest, wenn das GUI-Fenster geschlossen (oder ESC gedrueckt)
+    wurde. Wird im Hauptloop wie STRG+C behandelt: sauberer Shutdown mit
+    Speichern der Modelle/Historie."""
+
+
 def make_player_vec_env(level: dict, cfg: Config, n_envs: int):
     """Baut ein vektorisiertes Player-Environment. Nutzt SubprocVecEnv fuer
     echten Multi-Core-Support, sobald n_envs > 1 (sonst DummyVecEnv)."""
@@ -76,18 +82,48 @@ class FeedbackTracker:
         return dict(self.ema)
 
 
-def evaluate_level(level: dict, player_model, cfg: Config, target_difficulty: float) -> tuple[float, dict]:
+def evaluate_level(
+    level: dict,
+    player_model,
+    cfg: Config,
+    target_difficulty: float,
+    gui=None,
+    cycle: int = 0,
+) -> tuple[float, dict]:
     """Trainiert den Player kurz auf diesem Level, spielt dann eval_runs
-    komplette Runs und berechnet den difficulty_score."""
+    komplette Runs und berechnet den difficulty_score. Zeichnet bei
+    aktivem GUI live die Spielerbewegung waehrend Training und Eval."""
     vec_env = make_player_vec_env(level, cfg, cfg.n_envs)
     player_model.set_env(vec_env)
-    player_model.learn(total_timesteps=cfg.n_player_steps, reset_num_timesteps=False, progress_bar=False)
+
+    callback = None
+    if gui is not None:
+        from gui import make_gui_callback
+
+        def _train_info():
+            return [
+                f"Cycle: {cycle}",
+                f"Level: {level['name']}",
+                f"Target avg_deaths: {target_difficulty}",
+                f"Tiles: {len(level['tiles'])}",
+                "",
+                "Player-PPO trainiert auf diesem Level ...",
+            ]
+
+        callback = make_gui_callback(gui, level, phase="PLAYER TRAINING", render_every=cfg.gui_render_every, info_fn=_train_info)
+
+    player_model.learn(total_timesteps=cfg.n_player_steps, reset_num_timesteps=False, progress_bar=False, callback=callback)
+
+    if gui is not None and gui.want_quit:
+        vec_env.close()
+        raise GuiQuit()
 
     # Evaluation: spiele bis genug komplette Runs eingesammelt wurden
     obs = vec_env.reset()
     completed = []
     max_eval_steps = cfg.max_attempts_per_run * cfg.max_steps_per_attempt * 4
     steps = 0
+    render_counter = 0
     while len(completed) < cfg.eval_runs and steps < max_eval_steps:
         action, _ = player_model.predict(obs, deterministic=False)
         obs, rewards, dones, infos = vec_env.step(action)
@@ -95,6 +131,24 @@ def evaluate_level(level: dict, player_model, cfg: Config, target_difficulty: fl
             if done and "run_won" in info:
                 completed.append(info)
         steps += cfg.n_envs
+
+        if gui is not None:
+            render_counter += 1
+            if render_counter % cfg.gui_render_every == 0:
+                from gui import decode_obs_position
+
+                x, y = decode_obs_position(obs[0], level)
+                info_lines = [
+                    f"Cycle: {cycle}",
+                    f"Level: {level['name']}",
+                    f"Target avg_deaths: {target_difficulty}",
+                    "",
+                    f"Evaluiert: {len(completed)}/{cfg.eval_runs} Runs abgeschlossen",
+                ]
+                gui.render(level, player_pos=(x, y), info_lines=info_lines, phase="PLAYER EVALUATION")
+            if gui.want_quit:
+                vec_env.close()
+                raise GuiQuit()
 
     vec_env.close()
 
@@ -135,12 +189,27 @@ def append_history(cfg: Config, entry: dict) -> None:
     history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
 
-def cooldown(seconds: float) -> None:
-    """Cooldown mit Countdown. STRG+C hier ist sicher (kein Trap, sauberer Exit)."""
+def cooldown(seconds: float, gui=None, level: dict | None = None, info_lines: list[str] | None = None) -> None:
+    """Cooldown mit Countdown. STRG+C hier ist sicher (kein Trap, sauberer
+    Exit). Bei aktivem GUI wird der Countdown zusaetzlich im Fenster
+    angezeigt; Fenster schliessen wirft hier GuiQuit (wird wie STRG+C
+    behandelt)."""
     remaining = int(round(seconds))
     parts = [str(n) for n in range(remaining, 0, -1)] + ["GO"]
     print("[COOLDOWN] " + " ".join(parts))
-    time.sleep(seconds)
+
+    if gui is None or level is None:
+        time.sleep(seconds)
+        return
+
+    end_time = time.time() + seconds
+    while time.time() < end_time:
+        secs_left = max(0, int(round(end_time - time.time())))
+        lines = (info_lines or []) + ["", f"Cooldown: {secs_left}s", "(STRG+C oder Fenster schliessen zum Stoppen)"]
+        gui.render(level, player_pos=None, info_lines=lines, phase="COOLDOWN")
+        if gui.want_quit:
+            raise GuiQuit()
+        time.sleep(0.1)
 
 
 def main() -> None:
@@ -160,13 +229,23 @@ def main() -> None:
     builder_path = models_dir / "builder.zip"
     player_path = models_dir / "player.zip"
 
+    gui = None
+    if cfg.gui_enabled:
+        try:
+            from gui import PipelineGUI
+
+            gui = PipelineGUI()
+            print("[GUI] Live-Visualisierung aktiv (Fenster schliessen oder ESC zum Stoppen)")
+        except ImportError:
+            print("[GUI] pygame nicht installiert -- GUI deaktiviert. Installiere mit: pip install pygame")
+
     tracker = FeedbackTracker(alpha=cfg.ema_alpha, target_difficulty=cfg.target_difficulty)
 
     def export_and_lint_fn(level: dict):
         return export_level(level, cfg, level["cycle"])
 
     def play_and_score_fn(level: dict):
-        return evaluate_level(level, player_model, cfg, cfg.target_difficulty)
+        return evaluate_level(level, player_model, cfg, cfg.target_difficulty, gui=gui, cycle=level["cycle"])
 
     builder_env = BuilderEnv(
         width=cfg.grid_width,
@@ -242,9 +321,21 @@ def main() -> None:
                     "lint_ok": False,
                     "errors": info["errors"],
                 })
+                if gui is not None:
+                    gui.render(
+                        builder_env.last_level,
+                        player_pos=None,
+                        info_lines=[f"Cycle: {cycle}", "LINT FEHLGESCHLAGEN:"] + [f"- {e}" for e in info["errors"][:6]],
+                        phase="BUILDER: LEVEL VERWORFEN",
+                    )
                 # Builder-Update auch bei Fail (negativer Reward), dann direkt Cooldown
                 builder_model.learn(total_timesteps=max(1, cfg.n_builder_steps), reset_num_timesteps=False)
-                cooldown(cfg.cooldown_seconds)
+                cooldown(
+                    cfg.cooldown_seconds,
+                    gui=gui,
+                    level=builder_env.last_level,
+                    info_lines=[f"Cycle: {cycle}", "Level verworfen (Lint-Fehler)"],
+                )
                 continue
 
             print("[4. LINT OK]")
@@ -281,13 +372,26 @@ def main() -> None:
             builder_model.save(str(builder_path))
             player_model.save(str(player_path))
 
-            cooldown(cfg.cooldown_seconds)
+            cooldown(
+                cfg.cooldown_seconds,
+                gui=gui,
+                level=builder_env.last_level,
+                info_lines=[
+                    f"Cycle: {cycle}",
+                    f"Score: {feedback_raw['score']:.2f} | Best: {tracker.best_score:.2f} @c{tracker.best_cycle}",
+                    f"avg_deaths: {feedback_raw['avg_deaths']:.1f} (Ziel: {cfg.target_difficulty})",
+                    f"winrate: {feedback_raw['winrate']:.2f}",
+                ],
+            )
 
-    except KeyboardInterrupt:
-        print("\n[STOP] STRG+C erkannt waehrend Cooldown -- speichere und beende sauber ...")
+    except (KeyboardInterrupt, GuiQuit) as e:
+        reason = "STRG+C erkannt" if isinstance(e, KeyboardInterrupt) else "GUI-Fenster geschlossen"
+        print(f"\n[STOP] {reason} -- speichere und beende sauber ...")
         models_dir.mkdir(parents=True, exist_ok=True)
         builder_model.save(str(builder_path))
         player_model.save(str(player_path))
+        if gui is not None:
+            gui.close()
         print("Pipeline sauber gestoppt.")
         sys.exit(0)
 

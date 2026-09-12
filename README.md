@@ -32,7 +32,8 @@ gewertet zu werden.
 ```bash
 pip install -r requirements.txt
 ```
-or just run the related `setup.sh`
+
+or just run the related `setup.sh` file.
 
 `.env` enthält alle Parameter (Zielschwierigkeit, Cooldown, Grid-Größe,
 Ordner, `N_ENVS`, `DEVICE`, PPO-Steps, etc.) und wird automatisch von
@@ -43,7 +44,33 @@ Ordner, `N_ENVS`, `DEVICE`, PPO-Steps, etc.) und wird automatisch von
 python pipeline.py
 python pipeline.py --cooldown 10 --target 20
 python pipeline.py --n-envs 8 --device cuda
+python pipeline.py --gui                     # mit Live-Visualisierung
+python pipeline.py --gui --gui-render-every 5 # GUI, aber seltener rendern (schneller)
 ```
+
+## Live-GUI
+
+Mit `--gui` (oder `GUI_ENABLED=true` in `.env`) öffnet sich ein pygame-
+Fenster, das live zeigt, was Builder und Player gerade tun:
+
+- **Level-Grid (links):** das aktuell aktive Level inkl. Start (grün),
+  Ziel (gold), Traps (rot), Plattformen (braun) und festen Blöcken (grau).
+- **Spielerposition:** ein blauer Punkt bewegt sich während Training und
+  Evaluation live durchs Level (Sprünge, Tode, Landungen sichtbar).
+- **Info-Panel (rechts):** Zyklus, aktuelle Phase (`PLAYER TRAINING`,
+  `PLAYER EVALUATION`, `COOLDOWN`, `BUILDER: LEVEL VERWORFEN`), Score,
+  `avg_deaths` vs. Zielschwierigkeit, Best-Score.
+
+**Fenster schließen oder ESC** stoppt die Pipeline genauso sauber wie
+`STRG+C` im Cooldown (Modelle und `history.json` werden vorher gespeichert).
+
+`pygame` ist optional: ist es nicht installiert, läuft die Pipeline mit
+`--gui` trotzdem weiter (mit einer Warnung), nur eben ohne Fenster. Zum
+Nachinstallieren: `pip install pygame`.
+
+`GUI_RENDER_EVERY` (Default `3`) throttelt, wie oft tatsächlich gezeichnet
+wird — jeden Simulationsschritt zu rendern würde das Training unnötig
+verlangsamen.
 
 ## Loop
 
@@ -88,7 +115,8 @@ pcgrl_level_devil/
   game_engine.py          Physik-Simulation
   player_env.py            Gymnasium-Env fuer den Player (Space, A/D)
   builder_env.py            Gymnasium-Env fuer den Builder (Level-Generierung)
-  pipeline.py                Hauptloop
+  gui.py                     Optionale Live-Visualisierung (pygame, --gui)
+  pipeline.py                  Hauptloop
   levels/                     generierte Level (*.json)
   logs/history.json            Verlauf aller Zyklen
   models/builder.zip           Builder-PPO-Gewichte (wird geladen falls vorhanden)
@@ -140,9 +168,12 @@ nahtlos weitertrainieren.
 
 ## Getestet in dieser Umgebung
 
-`config.py`, `level_schema.py` (Linter) und `game_engine.py` (Physik,
-inkl. Landung und Tod an Spikes) sowie `builder_env.py` (Aktions-
-Dekodierung, Export/Lint-Verkettung) wurden hier bereits funktional
-geprüft. `torch`/`stable-baselines3` sind in dieser Sandbox nicht
-installiert – teste den vollen PPO-Trainingsloop (`python pipeline.py`)
-bitte einmal lokal nach `pip install -r requirements.txt`.
+`config.py`, `level_schema.py` (Linter inkl. BFS-Reachability-Check mit
+Sichtlinien-Prüfung), `game_engine.py` (Physik: Landung, Tod an Spikes,
+Einweg-Plattformen von unten/oben) sowie `builder_env.py`
+(Aktions-Dekodierung inkl. variablem Start/Ziel, Export/Lint-Verkettung)
+und `gui.py` (Rendering über mehrere Frames, headless via SDL-Dummy-Treiber
+getestet) wurden hier bereits funktional geprüft. `torch`/`stable-baselines3`
+sind in dieser Sandbox nicht dauerhaft installiert – teste den vollen
+PPO-Trainingsloop mit Fenster (`python pipeline.py --gui`) bitte einmal
+lokal nach `pip install -r requirements.txt`.
