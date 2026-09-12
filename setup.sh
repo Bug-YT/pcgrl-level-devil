@@ -16,5 +16,3 @@ if python -m pip install -r ./requirements.txt; then
 else
     printf '%s\n' "An error occurred while installing the required packages."
 fi
-
-printf '%s\n' "Please run '' if you want to start the project."
