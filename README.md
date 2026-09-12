@@ -32,6 +32,7 @@ gewertet zu werden.
 ```bash
 pip install -r requirements.txt
 ```
+or just run the related `setup.sh`
 
 `.env` enthält alle Parameter (Zielschwierigkeit, Cooldown, Grid-Größe,
 Ordner, `N_ENVS`, `DEVICE`, PPO-Steps, etc.) und wird automatisch von
