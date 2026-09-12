@@ -1,6 +1,0 @@
-python-dotenv
-jsonschema
-numpy
-torch
-stable-baselines3
-gymnasium

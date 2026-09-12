@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-levels/*.json
-logs/*.json
-models/*.zip
