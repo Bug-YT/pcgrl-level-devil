@@ -77,6 +77,7 @@ class BuilderEnv(gym.Env):
         self.last_level_path: str | None = None
         self.last_lint_ok: bool = True
         self.last_lint_errors: list[str] = []
+        self.last_info: dict | None = None
 
     def update_context(self, feedback: dict, cycle: int) -> None:
         """Wird von der Pipeline nach jedem Zyklus aufgerufen (read Feedback)."""
@@ -168,10 +169,12 @@ class BuilderEnv(gym.Env):
             # Ungueltiges Level: verworfen + Penalty, sofort zurueck (Cooldown macht die Pipeline)
             reward = -5.0
             info = {"lint_ok": False, "errors": errors, "feedback": None, "level_path": filepath}
+            self.last_info = info
             return self._obs(), reward, True, False, info
 
         score, feedback = self.play_and_score_fn(level)
         reward = float(score) / 10.0  # Skalierung fuer PPO
 
         info = {"lint_ok": True, "errors": [], "feedback": feedback, "level_path": filepath}
+        self.last_info = info
         return self._obs(), reward, True, False, info

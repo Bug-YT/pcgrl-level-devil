@@ -61,10 +61,26 @@ class StepResult:
 class LevelDevilEngine:
     """Grid-basierte Physik-Simulation fuer ein geladenes Level."""
 
-    def __init__(self, level: dict):
+    def __init__(
+        self,
+        level: dict,
+        gravity: float = GRAVITY,
+        move_speed: float = MOVE_SPEED,
+        jump_velocity: float = JUMP_VELOCITY,
+        max_fall_speed: float = MAX_FALL_SPEED,
+    ):
         self.width = level["width"]
         self.height = level["height"]
         self.grid = np.zeros((self.height, self.width), dtype=np.int32)
+
+        # Physik-Parameter sind instanzweise konfigurierbar (siehe .env /
+        # --gravity, --move-speed, --jump-velocity, --max-fall-speed),
+        # damit man die Spielgefuehl-Schwierigkeit ohne Codeaenderung
+        # tunen kann.
+        self.gravity = gravity
+        self.move_speed = move_speed
+        self.jump_velocity = jump_velocity
+        self.max_fall_speed = max_fall_speed
 
         # Standard-Boden in unterster Zeile, kann von expliziten Tiles ueberschrieben werden
         self.grid[self.height - 1, :] = TILE_SOLID
@@ -131,11 +147,11 @@ class LevelDevilEngine:
             move = 1.0
             jump = True
 
-        self.vx = move * MOVE_SPEED
+        self.vx = move * self.move_speed
         if jump and self.on_ground:
-            self.vy = JUMP_VELOCITY
+            self.vy = self.jump_velocity
 
-        self.vy = min(self.vy + GRAVITY, MAX_FALL_SPEED)
+        self.vy = min(self.vy + self.gravity, self.max_fall_speed)
 
         new_x = self.x + self.vx
         new_y = self.y + self.vy

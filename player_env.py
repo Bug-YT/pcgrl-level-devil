@@ -28,13 +28,30 @@ OBS_DIM = 8
 class PlayerEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, level: dict, max_attempts_per_run: int = 30, max_steps_per_attempt: int = 400):
+    def __init__(
+        self,
+        level: dict,
+        max_attempts_per_run: int = 30,
+        max_steps_per_attempt: int = 400,
+        gravity: float | None = None,
+        move_speed: float | None = None,
+        jump_velocity: float | None = None,
+        max_fall_speed: float | None = None,
+    ):
         super().__init__()
         self.level = level
         self.max_attempts_per_run = max_attempts_per_run
         self.max_steps_per_attempt = max_steps_per_attempt
+        # None => game_engine-Standardwerte verwenden (siehe LevelDevilEngine)
+        self._physics_kwargs = {
+            k: v
+            for k, v in dict(
+                gravity=gravity, move_speed=move_speed, jump_velocity=jump_velocity, max_fall_speed=max_fall_speed
+            ).items()
+            if v is not None
+        }
 
-        self.engine = LevelDevilEngine(level)
+        self.engine = LevelDevilEngine(level, **self._physics_kwargs)
         self.action_space = spaces.Discrete(N_ACTIONS)
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32)
 
@@ -45,7 +62,7 @@ class PlayerEnv(gym.Env):
 
     def set_level(self, level: dict) -> None:
         self.level = level
-        self.engine = LevelDevilEngine(level)
+        self.engine = LevelDevilEngine(level, **self._physics_kwargs)
 
     def _obs(self) -> np.ndarray:
         e = self.engine

@@ -1,7 +1,7 @@
 printf '%s\n' ""
 
 printf '%s\n' "Creating Python virtual environment..."
-python -m venv ./venv && printf '%s\n' "Virtual environment was successfully created." || printf '%s\n' "An error occurred while creating the virtual environment."
+python -m venv venv && printf '%s\n' "Virtual environment was successfully created." || printf '%s\n' "An error occurred while creating the virtual environment."
 
 printf '%s\n' "Activating virtual environment..."
 if . ./venv/bin/activate; then

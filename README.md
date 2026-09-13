@@ -4,8 +4,10 @@ Endloser Loop, in dem ein **Builder-Agent** (PPO) Level generiert und ein
 **Player-Agent** (PPO, Aktionen nur Space=Jump und A/D=Links/Rechts) sie
 spielt. Aus dem Spiel-Feedback lernt der Builder, Level zu bauen, deren
 Schwierigkeit (gemessen in `avg_deaths`) möglichst nah an
-`TARGET_DIFFICULTY` liegt. **Kein Early Stop** – die Pipeline läuft, bis
-du im Cooldown-Fenster `STRG+C` drückst.
+`TARGET_DIFFICULTY` liegt. Ein Level wird so lange trainiert, bis es
+**geschafft** oder als **praktisch nicht schaffbar aufgegeben** wird –
+erst dann generiert der Builder ein neues. **Kein Early Stop** – die
+Pipeline läuft, bis du im Cooldown-Fenster `STRG+C` drückst.
 
 ## Wichtige Annahme (bitte lesen)
 
@@ -32,8 +34,6 @@ gewertet zu werden.
 ```bash
 pip install -r requirements.txt
 ```
-
-or just run the related `setup.sh` file.
 
 `.env` enthält alle Parameter (Zielschwierigkeit, Cooldown, Grid-Größe,
 Ordner, `N_ENVS`, `DEVICE`, PPO-Steps, etc.) und wird automatisch von
@@ -77,13 +77,14 @@ verlangsamen.
 ```
 (read Feedback) -> Gen Level -> Export Level as "level_c<CYCLE>_<TS>.json"
 -> Check Syntax per Linter -> Load Level into engine/game
--> Play with the RL -> Give Feedback -> Cooldown 5s -> repeat
+-> Play with the RL (bis geschafft oder aufgegeben) -> Give Feedback
+-> Cooldown 5s -> repeat
 ```
 
 - **Linter** (`level_schema.py`): (1) JSON-Schema, (2) `width`/`height` in
   1–100, (3) mindestens 1 Start- und 1 Goal-Tile, (4) BFS-Erreichbarkeit
   (Ziel muss vom Start aus per Sprung/Fall erreichbar sein – berücksichtigt
-  `max_jump_height`/`max_jump_dist` und prüft die Sichtlinie zwischen zwei
+  `MAX_JUMP_HEIGHT`/`MAX_JUMP_DIST` und prüft die Sichtlinie zwischen zwei
   Zellen, damit z. B. eine durchgehende Wand korrekt als Blockade erkannt
   wird statt übersprungen zu werden). Das ist eine **topologische
   Approximation**, keine exakte Sprungkurven-Simulation – Traps blockieren
@@ -91,17 +92,74 @@ verlangsamen.
   darüberspringen; sie beeinflussen die Schwierigkeit, nicht die
   grundsätzliche Lösbarkeit). Bei Fail: Level verworfen, Penalty-Reward für
   den Builder, sofort Cooldown.
+- **Play-Phase (Level erst wechseln wenn geschafft/unschaffbar):** Ein
+  lint-gültiges Level wird in **Runden** (Training + Evaluation)
+  wiederholt gespielt – **nicht** sofort durch ein neues ersetzt. Nach
+  jeder Runde prüft die Pipeline die Winrate:
+  - `winrate >= WIN_THRESHOLD` (Default `1.0`) → Level gilt als
+    **geschafft**. Der Builder generiert danach ein neues Level.
+  - Nach `MAX_ROUNDS_PER_LEVEL` (Default `10`) Runden ohne Erfolg gilt
+    das Level als **praktisch nicht schaffbar** und wird **aufgegeben**
+    (obwohl der Linter es als erreichbar eingestuft hatte – die
+    BFS-Prüfung ist nur eine Approximation, siehe oben). Der Score wird
+    dabei um `GIVEUP_PENALTY` (Default `20`) reduziert, damit der Builder
+    lernt, dass es zu schwer war.
+
+  Jede Runde wird in der Konsole als `[RUNDE n/N] winrate=... avg_deaths=...
+  score=...` geloggt; bei aktivem GUI läuft die Live-Visualisierung über
+  alle Runden hinweg weiter.
 - **Feedback**: `winrate`, `avg_deaths`, `avg_time`, `score = 100 /
-  (1 + |avg_deaths - target|)`, EMA-geglättet mit `alpha=0.2`. Bestes
-  Level wird gemerkt, es gibt aber keinen Abbruch.
+  (1 + |avg_deaths - target|)` (nach `GIVEUP_PENALTY`-Abzug bei
+  aufgegebenen Leveln), EMA-geglättet mit `EMA_ALPHA`. Bestes Level wird
+  gemerkt, es gibt aber keinen Abbruch.
 - **Cooldown**: Countdown `5 4 3 2 1 GO`. `STRG+C` **hier** ist sicher –
-  `history.json` wird gespeichert, Modelle werden gesichert, sauberer
-  Exit ohne Traceback.
+  `history.json` und `stats.json` werden gespeichert, Modelle werden
+  gesichert, sauberer Exit ohne Traceback.
 - **Multi-Core**: `device_utils.py` erkennt GPU (`torch.cuda`) und
   CPU-Kerne automatisch und meldet z. B. `[DEVICE] Using GPU - 1 x
   NVIDIA RTX 4090` bzw. `[DEVICE] Using CPU - 12 Cores`. `N_ENVS`
   parallele `PlayerEnv`-Instanzen laufen über `SubprocVecEnv` (echte
   Multi-Core-Nutzung) für Training und Evaluation.
+
+## Statistik
+
+Nach jedem abgeschlossenen Level (geschafft oder aufgegeben) aktualisiert
+die Pipeline `logs/stats.json` und druckt eine Zusammenfassung in die
+Konsole: Laufzeit, Anzahl generierter/gescheiterter/geschaffter/
+aufgegebener Level, Gesamt-Trainingsrunden, Gesamt-Player-Env-Steps,
+Best-Score sowie rollierende Durchschnittswerte (`STATS_WINDOW`, Default
+`20`) für Score, `avg_deaths`, Winrate und Runden/Level.
+
+Um nur die zuletzt gespeicherte Statistik zu sehen, ohne zu trainieren:
+
+```bash
+python pipeline.py --stats
+```
+
+## Weitere Einstellungen (Flags & `.env`)
+
+Alle Werte stehen in `.env` und lassen sich per CLI überschreiben (siehe
+`config.py` für die vollständige Liste). Auswahl der neueren Optionen:
+
+| `.env`-Variable | CLI-Flag | Bedeutung | Default |
+|---|---|---|---|
+| `WIN_THRESHOLD` | `--win-threshold` | Winrate ab der ein Level als geschafft gilt | `1.0` |
+| `MAX_ROUNDS_PER_LEVEL` | `--max-rounds-per-level` | Max. Runden pro Level vor "aufgegeben" | `10` |
+| `GIVEUP_PENALTY` | `--giveup-penalty` | Score-Abzug bei aufgegebenem Level | `20.0` |
+| `MAX_JUMP_HEIGHT` / `MAX_JUMP_DIST` | `--max-jump-height` / `--max-jump-dist` | Reachability-Check-Parameter | `3` / `4` |
+| `PLAYER_LEARNING_RATE` / `BUILDER_LEARNING_RATE` | `--player-lr` / `--builder-lr` | PPO-Lernraten | `0.0003` |
+| `PPO_VERBOSE` | `--ppo-verbose` | SB3-Ausgabelevel (0/1/2) | `0` |
+| `GRAVITY` / `MOVE_SPEED` / `JUMP_VELOCITY` / `MAX_FALL_SPEED` | `--gravity` / `--move-speed` / `--jump-velocity` / `--max-fall-speed` | Physik-Konstanten der Engine (leer = Engine-Default) | leer |
+| `STATS_WINDOW` | `--stats-window` | Rolling-Average-Fenster für die Statistik | `20` |
+| `SEED` | `--seed` | Fixer Zufalls-Seed für reproduzierbare Läufe | leer (zufällig) |
+| — | `--stats` | Nur gespeicherte Statistik zeigen, kein Training | — |
+
+Beispiel für einen schnelleren, deterministischen Testlauf mit lockerer
+Erfolgsschwelle:
+
+```bash
+python pipeline.py --win-threshold 0.6 --max-rounds-per-level 5 --seed 42 --player-lr 0.001
+```
 
 ## Ordnerstruktur
 
@@ -112,15 +170,17 @@ pcgrl_level_devil/
   config.py            Config laden (.env + CLI)
   device_utils.py       CPU/GPU-Erkennung
   level_schema.py        Level-JSON-Schema + Linter
-  game_engine.py          Physik-Simulation
+  game_engine.py          Physik-Simulation (konfigurierbare Konstanten)
   player_env.py            Gymnasium-Env fuer den Player (Space, A/D)
   builder_env.py            Gymnasium-Env fuer den Builder (Level-Generierung)
   gui.py                     Optionale Live-Visualisierung (pygame, --gui)
-  pipeline.py                  Hauptloop
-  levels/                     generierte Level (*.json)
-  logs/history.json            Verlauf aller Zyklen
-  models/builder.zip           Builder-PPO-Gewichte (wird geladen falls vorhanden)
-  models/player.zip            Player-PPO-Gewichte (wird geladen falls vorhanden)
+  stats.py                    Statistik-Tracking (logs/stats.json, --stats)
+  pipeline.py                   Hauptloop
+  levels/                        generierte Level (*.json)
+  logs/history.json               Verlauf aller Zyklen/Runden
+  logs/stats.json                  Aggregierte Statistik (siehe --stats)
+  models/builder.zip                Builder-PPO-Gewichte (wird geladen falls vorhanden)
+  models/player.zip                 Player-PPO-Gewichte (wird geladen falls vorhanden)
 ```
 
 ## Level-JSON-Format
@@ -168,12 +228,17 @@ nahtlos weitertrainieren.
 
 ## Getestet in dieser Umgebung
 
-`config.py`, `level_schema.py` (Linter inkl. BFS-Reachability-Check mit
-Sichtlinien-Prüfung), `game_engine.py` (Physik: Landung, Tod an Spikes,
-Einweg-Plattformen von unten/oben) sowie `builder_env.py`
-(Aktions-Dekodierung inkl. variablem Start/Ziel, Export/Lint-Verkettung)
-und `gui.py` (Rendering über mehrere Frames, headless via SDL-Dummy-Treiber
-getestet) wurden hier bereits funktional geprüft. `torch`/`stable-baselines3`
-sind in dieser Sandbox nicht dauerhaft installiert – teste den vollen
-PPO-Trainingsloop mit Fenster (`python pipeline.py --gui`) bitte einmal
-lokal nach `pip install -r requirements.txt`.
+`config.py` (inkl. aller neuen Flags/`.env`-Werte), `level_schema.py`
+(Linter inkl. BFS-Reachability-Check mit Sichtlinien-Prüfung und
+konfigurierbaren `MAX_JUMP_HEIGHT`/`MAX_JUMP_DIST`), `game_engine.py`
+(Physik: Landung, Tod an Spikes, Einweg-Plattformen von unten/oben,
+konfigurierbare Physik-Konstanten), `builder_env.py` (Aktions-Dekodierung
+inkl. variablem Start/Ziel, Export/Lint-Verkettung), `stats.py`
+(Statistik-Aggregation inkl. `--stats`-Ausgabe) und `gui.py` (Rendering
+über mehrere Frames, headless via SDL-Dummy-Treiber getestet) wurden hier
+bereits funktional geprüft. `torch`/`stable-baselines3` sind in dieser
+Sandbox nicht dauerhaft installiert – die "Runde bis geschafft/aufgegeben"-
+Logik in `evaluate_level` (pipeline.py) ist daher nur durch Code-Review
+und die isoliert getesteten Bausteine abgesichert, nicht end-to-end mit
+echtem PPO-Training. Teste den vollen Loop (`python pipeline.py --gui`)
+bitte einmal lokal nach `pip install -r requirements.txt`.
