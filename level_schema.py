@@ -4,13 +4,34 @@ level_schema.py
 Definiert das Level-JSON-Format und den Linter, der jedes generierte
 Level vor dem Laden in die Engine prueft.
 
-Tile-Typen:
+Tile-Typen (Basis, aus V5):
   0 = leer (Luft)
   1 = fester Block (Boden/Wand)
   2 = Falle / Spike (Tod bei Beruehrung)
   3 = Plattform (einweg-begehbar: von unten durchspringbar, von oben landbar)
   4 = Start
   5 = Ziel (Goal)
+
+Tile-Typen (neu, inspiriert von echten Level-Devil-Mechaniken):
+  6 = Bounce-Pad / Trampolin (schleudert den Spieler nach oben)
+  7 = Fake-Floor (sieht solide aus, bricht nach kurzer Standzeit weg)
+  8 = Buzzsaw (patrouilliert horizontal, toedlich bei Beruehrung)
+  9 = Coin (Koeder -- loest beim Einsammeln eine versteckte Falle aus)
+  10 = Gravity-Flip-Trigger (kehrt beim Beruehren die Schwerkraft um)
+  11 = Invisible Platform (wie Plattform, aber unsichtbar bis zur Beruehrung)
+
+Optionale Zusatzfelder pro Tile (werden von game_engine.py ausgewertet,
+vom Linter nur locker validiert):
+  - Buzzsaw (type 8): "range" (int, Patrouillenradius in Tiles um die
+    Spawn-Position, Default siehe game_engine.DEFAULT_BUZZSAW_RANGE)
+  - Coin (type 9): "trap_x"/"trap_y" (int, Zielzelle die beim Einsammeln
+    zu einer Falle wird)
+
+Optionales Level-weites Feld:
+  - "goal_flees": bool -- wenn true, kann das Ziel vor dem Spieler
+    "wegfliehen", wenn er sich naehert (siehe game_engine.py)
+  - "goal_flee_chance": float (0-1) -- Wahrscheinlichkeit pro Schritt,
+    dass die Flucht ausgeloest wird, wenn der Spieler nah genug ist
 """
 
 from __future__ import annotations
@@ -26,8 +47,31 @@ TILE_TRAP = 2
 TILE_PLATFORM = 3
 TILE_START = 4
 TILE_GOAL = 5
+TILE_BOUNCE = 6
+TILE_FAKE_FLOOR = 7
+TILE_BUZZSAW = 8
+TILE_COIN = 9
+TILE_GRAVITY_FLIP = 10
+TILE_INVISIBLE_PLATFORM = 11
 
-VALID_TILE_TYPES = {TILE_EMPTY, TILE_SOLID, TILE_TRAP, TILE_PLATFORM, TILE_START, TILE_GOAL}
+VALID_TILE_TYPES = {
+    TILE_EMPTY, TILE_SOLID, TILE_TRAP, TILE_PLATFORM, TILE_START, TILE_GOAL,
+    TILE_BOUNCE, TILE_FAKE_FLOOR, TILE_BUZZSAW, TILE_COIN, TILE_GRAVITY_FLIP,
+    TILE_INVISIBLE_PLATFORM,
+}
+
+# Fuer die (approximative) Reachability-Pruefung kategorisiert:
+# - "blockierend": man kann nicht INS Tile hineinlaufen/springen (wie eine Wand)
+# - "Oberflaeche": man kann darauf STEHEN (die Zelle darueber ist begehbar)
+# Fake-Floor zaehlt strukturell wie solide (er traegt kurzzeitig, das reicht
+# fuer die topologische Pruefung -- das tatsaechliche Wegbrechen ist reine
+# Laufzeit-Mechanik in game_engine.py). Bounce-Pad, Plattform und die
+# unsichtbare Plattform sind alle "Oberflaechen" (einweg-begehbar).
+# Buzzsaw, Coin, Gravity-Flip-Trigger sind bewusst NICHT blockierend --
+# sie sind dynamische/optionale Hindernisse, keine strukturellen Waende
+# (aehnlich wie normale Traps, siehe check_reachability-Docstring).
+BLOCKING_FOR_TRAVERSAL = {TILE_SOLID, TILE_FAKE_FLOOR}
+SURFACE_TILES = {TILE_SOLID, TILE_PLATFORM, TILE_FAKE_FLOOR, TILE_BOUNCE, TILE_INVISIBLE_PLATFORM}
 
 # Bewegungsreichweite fuer die Reachability-Pruefung. Muss grob zur Physik
 # in game_engine.py passen (Sprunghoehe/-weite). Bewusst etwas grosszuegiger
@@ -46,6 +90,8 @@ LEVEL_JSON_SCHEMA = {
         "height": {"type": "integer", "minimum": 1, "maximum": 100},
         "target_deaths": {"type": "number"},
         "cycle": {"type": "integer", "minimum": 0},
+        "goal_flees": {"type": "boolean"},
+        "goal_flee_chance": {"type": "number", "minimum": 0, "maximum": 1},
         "tiles": {
             "type": "array",
             "items": {
@@ -55,6 +101,9 @@ LEVEL_JSON_SCHEMA = {
                     "x": {"type": "integer", "minimum": 0},
                     "y": {"type": "integer", "minimum": 0},
                     "type": {"type": "integer"},
+                    "range": {"type": "integer", "minimum": 1},
+                    "trap_x": {"type": "integer", "minimum": 0},
+                    "trap_y": {"type": "integer", "minimum": 0},
                 },
             },
         },
@@ -82,20 +131,20 @@ def _build_grid(level: dict) -> list[list[int]]:
 
 
 def _is_standable_surface(grid: list[list[int]], x: int, y: int) -> bool:
-    """Zelle (x,y) ist begehbar, wenn sie selbst nicht solide ist und
-    darunter Boden (solide oder Plattform) liegt."""
+    """Zelle (x,y) ist begehbar, wenn sie selbst nicht blockierend ist und
+    darunter eine Oberflaeche (Boden/Plattform/...) liegt."""
     height = len(grid)
-    if grid[y][x] in (TILE_SOLID,):
+    if grid[y][x] in BLOCKING_FOR_TRAVERSAL:
         return False
     below_y = y + 1
     if below_y >= height:
         return False
-    return grid[below_y][x] in (TILE_SOLID, TILE_PLATFORM)
+    return grid[below_y][x] in SURFACE_TILES
 
 
 def _line_clear(grid: list[list[int]], x0: int, y0: int, x1: int, y1: int, height: int) -> bool:
     """Prueft, ob die direkte Verbindungslinie zwischen zwei Zellen frei von
-    soliden Bloecken ist (inkl. einer Kopf-Zeile fuer die Spielerhoehe).
+    blockierenden Bloecken ist (inkl. einer Kopf-Zeile fuer die Spielerhoehe).
     Ohne diese Pruefung wuerde ein grosser dx/dy-Sprung eine dazwischen
     stehende Wand faelschlich 'ueberspringen', da nur das Ziel geprueft
     wird statt des Wegs dorthin."""
@@ -108,7 +157,7 @@ def _line_clear(grid: list[list[int]], x0: int, y0: int, x1: int, y1: int, heigh
         if not (0 <= xi < width):
             return False
         for yy in (yi, yi - 1):  # Zelle + Kopfhoehe
-            if 0 <= yy < height and grid[yy][xi] == TILE_SOLID:
+            if 0 <= yy < height and grid[yy][xi] in BLOCKING_FOR_TRAVERSAL:
                 return False
     return True
 
@@ -122,14 +171,17 @@ def check_reachability(
     vom Start-Tile das Goal-Tile ueberhaupt erreichen?
 
     Das ist eine TOPOLOGISCHE APPROXIMATION, keine exakte Sprungkurven-
-    Simulation: Traps werden nicht als Blockade gewertet (der Spieler kann
-    im Normalfall darueber springen -- sie beeinflussen die Schwierigkeit,
-    nicht die grundsaetzliche Loesbarkeit). Geprueft wird, ob es eine Kette
-    aus stehbaren Zellen gibt, die per Sprung (seitlich max_jump_dist, nach
-    oben max_jump_height, nach unten beliebig weit) verbunden sind UND
-    deren direkte Verbindungslinie nicht durch einen soliden Block
-    blockiert wird (siehe _line_clear) -- so werden z.B. durchgehende
-    Waende korrekt als Blockade erkannt statt uebersprungen.
+    oder Zeit-Simulation: Traps, Buzzsaws, Coins und Gravity-Flip-Trigger
+    werden nicht als Blockade gewertet (der Spieler kann sie im Normalfall
+    umgehen/ueberspringen -- sie beeinflussen die Schwierigkeit, nicht die
+    grundsaetzliche Lösbarkeit). Ein fliehendes Ziel (goal_flees) wird an
+    seiner AUTORIERTEN Position geprueft; das Wegfliehen ist reine
+    Laufzeit-Mechanik und macht ein Level nicht strukturell unloesbar.
+    Geprueft wird, ob es eine Kette aus stehbaren Zellen gibt, die per
+    Sprung (seitlich max_jump_dist, nach oben max_jump_height, nach unten
+    beliebig weit) verbunden sind UND deren direkte Verbindungslinie nicht
+    durch einen blockierenden Block laeuft (siehe _line_clear) -- so werden
+    z.B. durchgehende Waende korrekt als Blockade erkannt statt uebersprungen.
     """
     width, height = level["width"], level["height"]
     grid = _build_grid(level)
@@ -160,7 +212,7 @@ def check_reachability(
                     continue
                 if (nx, ny) in visited:
                     continue
-                if grid[ny][nx] == TILE_SOLID:
+                if grid[ny][nx] in BLOCKING_FOR_TRAVERSAL:
                     continue
                 if not _line_clear(grid, x, y, nx, ny, height):
                     continue
@@ -181,7 +233,9 @@ def lint_level(
 ) -> LintResult:
     """Prueft: 1) gueltiges JSON-Schema  2) width/height im Bereich 1-100
     3) mindestens 1 Start-Tile und 1 Goal-Tile vorhanden
-    4) (optional) Goal ist vom Start aus ueberhaupt erreichbar (BFS)."""
+    4) (optional) Goal ist vom Start aus ueberhaupt erreichbar (BFS)
+    5) Buzzsaw-"range" und Coin-"trap_x"/"trap_y" liegen (falls gesetzt)
+       innerhalb des Levels."""
     errors: list[str] = []
 
     try:
@@ -205,6 +259,12 @@ def lint_level(
             errors.append(f"x={t['x']} ausserhalb der Breite {width}")
         if not (0 <= t["y"] < height):
             errors.append(f"y={t['y']} ausserhalb der Hoehe {height}")
+        if t["type"] == TILE_COIN:
+            tx, ty = t.get("trap_x"), t.get("trap_y")
+            if tx is not None and not (0 <= tx < width):
+                errors.append(f"Coin bei ({t['x']},{t['y']}): trap_x={tx} ausserhalb der Breite {width}")
+            if ty is not None and not (0 <= ty < height):
+                errors.append(f"Coin bei ({t['x']},{t['y']}): trap_y={ty} ausserhalb der Hoehe {height}")
 
     n_start = sum(1 for t in tiles if t["type"] == TILE_START)
     n_goal = sum(1 for t in tiles if t["type"] == TILE_GOAL)

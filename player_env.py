@@ -8,10 +8,17 @@ Aktionsraum: Discrete(6) -> nur Kombinationen aus Space (Jump) und A/D
 Timing, etc.) lernt der Agent selbst.
 
 Ein "Run" (= eine Episode) besteht aus mehreren "Versuchen" (Attempts):
-stirbt der Spieler an einer Falle, wird er an den Start zurueckgesetzt
-(Death-Counter +1), der Run laeuft weiter bis entweder das Goal erreicht
-wird ODER max_attempts_per_run Tode erreicht sind. So bildet avg_deaths
-pro Run direkt die Level-Devil-Schwierigkeit ab.
+stirbt der Spieler an einer Falle/Buzzsaw, wird er an den Start
+zurueckgesetzt (Death-Counter +1), der Run laeuft weiter bis entweder das
+Goal erreicht wird ODER max_attempts_per_run Tode erreicht sind. So bildet
+avg_deaths pro Run direkt die Level-Devil-Schwierigkeit ab.
+
+Die Observation enthaelt neben Position/Geschwindigkeit auch die aktuelle
+Gravitationsrichtung (wichtig nach einem Gravity-Flip-Trigger, sonst kann
+der Agent die invertierte Steuerung nicht lernen) sowie die relative
+Position der naechsten Falle UND des naechsten Buzzsaws (bewegliche
+Hindernisse lassen sich nicht aus dem statischen Level-Layout allein
+vorhersagen).
 """
 
 from __future__ import annotations
@@ -21,8 +28,10 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from game_engine import LevelDevilEngine, N_ACTIONS
+from level_schema import TILE_TRAP
 
-OBS_DIM = 8
+OBS_DIM = 11
+_TRAP_TYPES = (TILE_TRAP,)
 
 
 class PlayerEnv(gym.Env):
@@ -69,7 +78,8 @@ class PlayerEnv(gym.Env):
         w, h = e.width, e.height
         dx = (e.goal_x - e.x) / max(w, 1)
         dy = (e.goal_y - e.y) / max(h, 1)
-        nearest_trap_dx, nearest_trap_dy = self._nearest_trap_offset()
+        trap_dx, trap_dy = self._nearest_match_offset(_TRAP_TYPES)
+        saw_dx = self._nearest_buzzsaw_offset()
         obs = np.array(
             [
                 (e.x / w) * 2 - 1,
@@ -79,19 +89,21 @@ class PlayerEnv(gym.Env):
                 1.0 if e.on_ground else -1.0,
                 np.clip(dx, -1, 1),
                 np.clip(dy, -1, 1),
-                np.clip(nearest_trap_dx, -1, 1),
+                np.clip(trap_dx, -1, 1),
+                np.clip(trap_dy, -1, 1),
+                np.clip(saw_dx, -1, 1),
+                float(e.gravity_sign),
             ],
             dtype=np.float32,
         )
         return obs
 
-    def _nearest_trap_offset(self) -> tuple[float, float]:
-        from level_schema import TILE_TRAP
-
+    def _nearest_match_offset(self, tile_types) -> tuple[float, float]:
         e = self.engine
         best_d = None
         best = (1.0, 1.0)
-        ys, xs = np.where(e.grid == TILE_TRAP)
+        mask = np.isin(e.grid, list(tile_types))
+        ys, xs = np.where(mask)
         for gx, gy in zip(xs, ys):
             d = (gx - e.x, gy - e.y)
             dist = abs(d[0]) + abs(d[1])
@@ -100,9 +112,29 @@ class PlayerEnv(gym.Env):
                 best = (d[0] / max(e.width, 1), d[1] / max(e.height, 1))
         return best
 
+    def _nearest_buzzsaw_offset(self) -> float:
+        e = self.engine
+        if not e._buzzsaws:
+            return 1.0
+        best_d = None
+        best_dx = 1.0
+        for saw in e._buzzsaws:
+            d = saw["x"] - e.x
+            dist = abs(d)
+            if best_d is None or dist < best_d:
+                best_d = dist
+                best_dx = d / max(e.width, 1)
+        return best_dx
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.engine.reset()
+        # Ein komplett neues Level (Runde) soll auch die Laufzeit-
+        # Mutationen des Vorlaufs (kollabierte Fake-Floors, eingesammelte
+        # Coins, ausgeloeste Fallen, geflipte Gravitation, gefluechtetes
+        # Ziel) zuruecksetzen -- also die Engine ganz neu aufbauen statt
+        # nur engine.reset() (das erhaelt Mutationen bewusst INNERHALB
+        # eines Runs, siehe game_engine.LevelDevilEngine.reset).
+        self.engine = LevelDevilEngine(self.level, **self._physics_kwargs)
         self.deaths = 0
         self.steps_in_attempt = 0
         self.total_steps_in_run = 0
@@ -128,17 +160,25 @@ class PlayerEnv(gym.Env):
         elif result.died or self.steps_in_attempt >= self.max_steps_per_attempt:
             reward -= 5.0
             self.deaths += 1
+            # Nur die Spielerposition zuruecksetzen -- Laufzeit-Mutationen
+            # (kollabierte Boeden, eingesammelte Coins, ausgeloeste Fallen,
+            # geflipte Gravitation, gefluechtetes Ziel) bleiben INNERHALB
+            # desselben Runs bestehen, damit wiederholte Versuche auf
+            # DEMSELBEN, bereits veraenderten Level stattfinden.
             self.engine.reset()
             self.steps_in_attempt = 0
             if self.deaths >= self.max_attempts_per_run:
                 terminated = True  # Run vorbei: nicht geschafft
 
-        info = {}
+        # Bei JEDEM Schritt (nicht nur am Episodenende) den Render-State
+        # mitschicken, damit eine Live-GUI Fake-Floor-Kollaps, Coin-
+        # Sammlung, Buzzsaw-Bewegung, Gravity-Flip und ein gefluechtetes
+        # Ziel auch dann sehen kann, wenn die Engine in einem separaten
+        # Prozess (SubprocVecEnv) laeuft.
+        info = {"engine_diff": self.engine.get_render_state()}
         if terminated:
-            info = {
-                "run_won": self.won,
-                "run_deaths": self.deaths,
-                "run_steps": self.total_steps_in_run,
-            }
+            info["run_won"] = self.won
+            info["run_deaths"] = self.deaths
+            info["run_steps"] = self.total_steps_in_run
 
         return self._obs(), reward, terminated, truncated, info

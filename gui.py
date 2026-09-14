@@ -16,13 +16,36 @@ nicht installiert, faengt pipeline.py das ab und laeuft ohne GUI weiter.
 Fenster schliessen oder ESC druecken setzt `want_quit = True` -- die
 Pipeline prueft dieses Flag an sicheren Stellen (Cooldown, nach jedem
 Trainingsblock) und faehrt dann genauso sauber herunter wie bei STRG+C.
+
+=== Laufzeit-Mutationen (Fake-Floor-Kollaps, Coins, Buzzsaws, ...) ===
+render() zeichnet normalerweise nur das STATISCHE, autorisierte Level-JSON
+(das ist alles, was diese Datei von sich aus kennt). Damit Fake-Floor-
+Einstuerze, eingesammelte Coins, ausgeloeste Fallen, die aktuelle
+Buzzsaw-Position, die Gravitationsrichtung und ein moeglicherweise
+gefluechtetes Ziel trotzdem live sichtbar sind, akzeptiert render() einen
+optionalen `dynamic_state`-Dict (siehe game_engine.LevelDevilEngine.
+get_render_state() / PlayerEnv-info["engine_diff"]) und legt diese
+Abweichungen ueber das statische Grid.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 
-from level_schema import TILE_EMPTY, TILE_GOAL, TILE_PLATFORM, TILE_SOLID, TILE_START, TILE_TRAP
+from level_schema import (
+    TILE_BOUNCE,
+    TILE_BUZZSAW,
+    TILE_COIN,
+    TILE_EMPTY,
+    TILE_FAKE_FLOOR,
+    TILE_GOAL,
+    TILE_GRAVITY_FLIP,
+    TILE_INVISIBLE_PLATFORM,
+    TILE_PLATFORM,
+    TILE_SOLID,
+    TILE_START,
+    TILE_TRAP,
+)
 
 CELL = 26
 PANEL_W = 340
@@ -35,7 +58,14 @@ COLORS = {
     TILE_PLATFORM: (150, 110, 60),
     TILE_START: (60, 180, 95),
     TILE_GOAL: (230, 190, 40),
+    TILE_BOUNCE: (60, 220, 130),
+    TILE_FAKE_FLOOR: (170, 120, 40),
+    TILE_COIN: (235, 200, 60),
+    TILE_GRAVITY_FLIP: (170, 90, 220),
+    TILE_INVISIBLE_PLATFORM: (24, 24, 32),  # unsichtbar, bis beruehrt (siehe revealed_invisible)
 }
+BUZZSAW_COLOR = (220, 60, 60)
+REVEALED_INVISIBLE_COLOR = (110, 90, 150)
 BG = (14, 14, 18)
 PANEL_BG = (26, 26, 34)
 TEXT_COLOR = (230, 230, 235)
@@ -79,7 +109,7 @@ class PipelineGUI:
         return self.want_quit
 
     @staticmethod
-    def _build_grid(level: dict) -> list[list[int]]:
+    def _build_grid(level: dict, dynamic_state: dict | None) -> tuple[list[list[int]], tuple[int, int] | None]:
         width, height = level["width"], level["height"]
         grid = [[TILE_EMPTY for _ in range(width)] for _ in range(height)]
         for x in range(width):
@@ -88,7 +118,31 @@ class PipelineGUI:
             x, y, typ = t["x"], t["y"], t["type"]
             if 0 <= x < width and 0 <= y < height:
                 grid[y][x] = typ
-        return grid
+
+        goal_pos = None
+        if dynamic_state:
+            for gx, gy in dynamic_state.get("collapsed_floors", []):
+                if 0 <= gx < width and 0 <= gy < height:
+                    grid[gy][gx] = TILE_EMPTY
+            for gx, gy in dynamic_state.get("collected_coins", []):
+                if 0 <= gx < width and 0 <= gy < height:
+                    grid[gy][gx] = TILE_EMPTY
+            for gx, gy in dynamic_state.get("spawned_traps", []):
+                if 0 <= gx < width and 0 <= gy < height:
+                    grid[gy][gx] = TILE_TRAP
+
+            new_goal = dynamic_state.get("goal_pos")
+            if new_goal is not None:
+                gx, gy = new_goal
+                orig_goal = next((t for t in level["tiles"] if t["type"] == TILE_GOAL), None)
+                if orig_goal is not None and (orig_goal["x"], orig_goal["y"]) != (gx, gy):
+                    if 0 <= orig_goal["x"] < width and 0 <= orig_goal["y"] < height:
+                        grid[orig_goal["y"]][orig_goal["x"]] = TILE_EMPTY
+                if 0 <= gx < width and 0 <= gy < height:
+                    grid[gy][gx] = TILE_GOAL
+                goal_pos = (gx, gy)
+
+        return grid, goal_pos
 
     def render(
         self,
@@ -96,21 +150,45 @@ class PipelineGUI:
         player_pos: tuple[float, float] | None = None,
         info_lines: list[str] | None = None,
         phase: str = "",
+        dynamic_state: dict | None = None,
     ) -> None:
         """Zeichnet einen Frame. player_pos ist optional (z.B. waehrend
-        COOLDOWN oder direkt nach der Level-Generierung nicht vorhanden)."""
+        COOLDOWN oder direkt nach der Level-Generierung nicht vorhanden).
+        dynamic_state (siehe Moduldocstring) blendet Laufzeit-Mutationen
+        ein, die im statischen `level`-Dict nicht sichtbar sind."""
         pygame = self._pg
         width, height = level["width"], level["height"]
         self._ensure_window(width, height)
 
-        grid = self._build_grid(level)
+        grid, _ = self._build_grid(level, dynamic_state)
+        revealed_invisible = set(dynamic_state.get("revealed_invisible", [])) if dynamic_state else set()
 
         self.screen.fill(BG)
         for y in range(height):
             for x in range(width):
-                color = COLORS.get(grid[y][x], COLORS[TILE_EMPTY])
+                cell = grid[y][x]
+                if cell == TILE_INVISIBLE_PLATFORM and (x, y) not in revealed_invisible:
+                    color = COLORS[TILE_EMPTY]  # noch unsichtbar
+                elif cell == TILE_INVISIBLE_PLATFORM:
+                    color = REVEALED_INVISIBLE_COLOR
+                else:
+                    color = COLORS.get(cell, COLORS[TILE_EMPTY])
                 rect = (x * CELL, y * CELL, CELL - 1, CELL - 1)
                 pygame.draw.rect(self.screen, color, rect)
+
+        # Buzzsaws: bei aktivem dynamic_state an der LIVE-Position zeichnen,
+        # sonst an der Spawn-Position aus dem statischen Level (Naeherung).
+        if dynamic_state and dynamic_state.get("buzzsaw_positions"):
+            for sx, sy in dynamic_state["buzzsaw_positions"]:
+                cx = int(sx * CELL + CELL * 0.5)
+                cy = int(sy * CELL + CELL * 0.5)
+                pygame.draw.circle(self.screen, BUZZSAW_COLOR, (cx, cy), CELL // 2 - 1)
+        else:
+            for t in level["tiles"]:
+                if t["type"] == TILE_BUZZSAW:
+                    cx = int(t["x"] * CELL + CELL * 0.5)
+                    cy = int(t["y"] * CELL + CELL * 0.5)
+                    pygame.draw.circle(self.screen, BUZZSAW_COLOR, (cx, cy), CELL // 2 - 1)
 
         if player_pos is not None:
             px, py = player_pos
@@ -128,7 +206,11 @@ class PipelineGUI:
         pygame.draw.line(self.screen, GRID_LINE, (panel_x + 14, y_off), (panel_x + PANEL_W - 14, y_off))
         y_off += 12
 
-        for line in info_lines or []:
+        all_lines = list(info_lines or [])
+        if dynamic_state and dynamic_state.get("gravity_sign", 1) == -1:
+            all_lines.append("⚠ Gravitation INVERTIERT")
+
+        for line in all_lines:
             surf = self.font.render(line, True, TEXT_COLOR)
             self.screen.blit(surf, (panel_x + 14, y_off))
             y_off += 22
@@ -174,8 +256,13 @@ def make_gui_callback(gui: "PipelineGUI", level: dict, phase: str, render_every:
             x = (float(obs[0][0]) + 1) / 2 * width
             y = (float(obs[0][1]) + 1) / 2 * height
 
+            dynamic_state = None
+            infos = self.locals.get("infos")
+            if infos:
+                dynamic_state = infos[0].get("engine_diff")
+
             info_lines = self.info_fn() if self.info_fn else []
-            self.gui.render(self.level, player_pos=(x, y), info_lines=info_lines, phase=self.phase)
+            self.gui.render(self.level, player_pos=(x, y), info_lines=info_lines, phase=self.phase, dynamic_state=dynamic_state)
             return not self.gui.want_quit
 
     return _GuiCallback()

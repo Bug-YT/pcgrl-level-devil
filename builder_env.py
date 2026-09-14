@@ -5,12 +5,33 @@ Gymnasium-Environment fuer den Builder-Agenten.
 
 Start- und Ziel-Position sind FREI waehlbar (nicht mehr fix am Rand) --
 der Builder lernt sie ueber die ersten 4 Aktionswerte
-[start_x, start_y, goal_x, goal_y]. Danach folgen bis zu max_objects
-generische Objekt-Slots im Format [aktiv, x, y, type_selector], ueber die
-der Builder Traps, Plattformen oder solide Bloecke platzieren kann (siehe
-OBJECT_TYPES). Ein einzelner, kompakter [aktiv,x,y,type]-Slot haelt den
+[start_x, start_y, goal_x, goal_y]. Zwei weitere feste Aktionswerte
+steuern, ob das Ziel "fliehen" kann (siehe game_engine.py) und mit
+welcher Wahrscheinlichkeit. Danach folgen bis zu max_objects generische
+Objekt-Slots im Format [aktiv, x, y, type_selector, extra], ueber die der
+Builder aus der vollen, Level-Devil-inspirierten Tile-Palette waehlen
+kann (siehe OBJECT_TYPES): Traps, Plattformen, feste Bloecke, Bounce-
+Pads, Fake-Floors, Buzzsaws, Coins (mit versteckter Falle) und
+Gravity-Flip-Trigger. Das "extra"-Feld wird je nach Typ unterschiedlich
+interpretiert (Buzzsaw-Patrouillenradius, Coin-Fallen-Richtung) und sonst
+ignoriert. Ein einzelner, kompakter [aktiv,x,y,type,extra]-Slot haelt den
 Action-Space uebersichtlich, auch wenn spaeter weitere Tile-Typen dazu
 kommen -- man muss nur OBJECT_TYPES erweitern, nicht die Vektorstruktur.
+
+=== "Inspiriert von echten Level-Devil-Leveln" ===
+Die rohe RL-Platzierung allein reproduziert die typischen Troll-Muster
+des echten Spiels nicht zuverlaessig genug (dafuer bruachte es sehr viel
+Training). Deshalb legt _apply_level_devil_flavor() nach der RL-Dekodierung
+eine kleine, KURATIERTE Konstruktionsschicht drueber, die drei konkrete,
+oft genannte Muster verstaerkt:
+  1. "Bounce-Pad katapultiert in Spikes": hinter einem Bounce-Pad landet
+     mit einer gewissen Wahrscheinlichkeit ein Trap in Sprungrichtung.
+  2. "Boden bricht kurz vor dem Ziel weg": solide/Plattform-Tiles nahe am
+     Ziel werden mit einer gewissen Wahrscheinlichkeit zu Fake-Floors.
+  3. "Coins sind Koeder": jeder vom Builder platzierte Coin bekommt
+     garantiert eine Fallen-Ziel-Zelle zugewiesen (statt nur manchmal).
+Das ist explizit eine HAND-AUTORIERTE Heuristik, kein gelerntes Verhalten
+-- ehrlich benannt, damit klar ist, was RL und was Konstruktionsregel ist.
 
 Eine Episode = EIN generiertes Level ("one-shot"): Der Builder gibt in
 einem einzigen step() einen Aktionsvektor aus, der in ein komplettes
@@ -22,21 +43,54 @@ Builder pro step() ein vollstaendiges Feedback-Signal.
 
 from __future__ import annotations
 
+import random
 from typing import Callable
 
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from level_schema import TILE_GOAL, TILE_PLATFORM, TILE_SOLID, TILE_START, TILE_TRAP
+from level_schema import (
+    TILE_BOUNCE,
+    TILE_BUZZSAW,
+    TILE_COIN,
+    TILE_FAKE_FLOOR,
+    TILE_GOAL,
+    TILE_GRAVITY_FLIP,
+    TILE_INVISIBLE_PLATFORM,
+    TILE_PLATFORM,
+    TILE_SOLID,
+    TILE_START,
+    TILE_TRAP,
+)
 
 OBS_DIM = 6  # target_norm, last_winrate, last_avg_deaths_norm, last_avg_time_norm, last_score_norm, cycle_norm
 
 # Reihenfolge = Bucket-Zuordnung bei der Dekodierung des type_selector-Werts.
-# Erweiterbar, ohne die Action-Space-Struktur (4 Werte pro Slot) zu aendern.
-OBJECT_TYPES = [TILE_TRAP, TILE_PLATFORM, TILE_SOLID]
-VALUES_PER_OBJECT = 4  # [aktiv, x, y, type_selector]
-N_FIXED_ACTIONS = 4  # [start_x, start_y, goal_x, goal_y]
+# Erweiterbar, ohne die Action-Space-Struktur zu aendern -- einfach hier
+# anhaengen.
+OBJECT_TYPES = [
+    TILE_TRAP,
+    TILE_PLATFORM,
+    TILE_SOLID,
+    TILE_BOUNCE,
+    TILE_FAKE_FLOOR,
+    TILE_BUZZSAW,
+    TILE_COIN,
+    TILE_GRAVITY_FLIP,
+    TILE_INVISIBLE_PLATFORM,
+]
+VALUES_PER_OBJECT = 5  # [aktiv, x, y, type_selector, extra]
+N_FIXED_ACTIONS = 6  # [start_x, start_y, goal_x, goal_y, goal_flees, goal_flee_chance]
+
+BUZZSAW_RANGE_MIN, BUZZSAW_RANGE_MAX = 1, 5
+GOAL_FLEE_CHANCE_MIN, GOAL_FLEE_CHANCE_MAX = 0.05, 0.5
+
+# Konstruktionsschicht (siehe Docstring oben) -- feste Wahrscheinlichkeiten,
+# bewusst kein Lernparameter.
+BOUNCE_INTO_TRAP_CHANCE = 0.4
+FAKE_FLOOR_NEAR_GOAL_CHANCE = 0.35
+FAKE_FLOOR_NEAR_GOAL_RADIUS = 4
 
 PlayAndScoreFn = Callable[[dict], tuple[float, dict]]
 ExportFn = Callable[[dict], tuple[bool, list[str], str]]  # -> (lint_ok, errors, filepath)
@@ -118,6 +172,9 @@ class BuilderEnv(gym.Env):
         start_y = self._norm_to_y(action[1])
         goal_x = self._norm_to_x(action[2])
         goal_y = self._norm_to_y(action[3])
+        goal_flees = bool(action[4] > 0.0)
+        goal_flee_chance = GOAL_FLEE_CHANCE_MIN + (action[5] + 1) / 2 * (GOAL_FLEE_CHANCE_MAX - GOAL_FLEE_CHANCE_MIN)
+        goal_flee_chance = float(goal_flee_chance)  # numpy.float32 -> natives Python float (sonst nicht JSON-serialisierbar)
 
         # Start und Ziel duerfen nicht auf derselben Zelle landen
         if (start_x, start_y) == (goal_x, goal_y):
@@ -132,8 +189,10 @@ class BuilderEnv(gym.Env):
         ]
         occupied = {(start_x, start_y), (goal_x, goal_y)}
 
+        travel_dir = 1 if goal_x >= start_x else -1  # Richtung Start -> Ziel, fuer die Flavor-Schicht
+
         obj_actions = np.asarray(action[N_FIXED_ACTIONS:], dtype=np.float32).reshape(self.max_objects, VALUES_PER_OBJECT)
-        for active, x_sig, y_sig, type_sig in obj_actions:
+        for active, x_sig, y_sig, type_sig, extra_sig in obj_actions:
             if active <= 0.0:  # Schwelle: Slot ist aktiv
                 continue
             x = self._norm_to_x(x_sig)
@@ -142,8 +201,20 @@ class BuilderEnv(gym.Env):
                 continue
             type_idx = int((type_sig + 1) / 2 * len(OBJECT_TYPES))
             type_idx = min(type_idx, len(OBJECT_TYPES) - 1)
+            tile_type = OBJECT_TYPES[type_idx]
+
+            tile: dict = {"x": x, "y": y, "type": tile_type}
+
+            if tile_type == TILE_BUZZSAW:
+                rng = BUZZSAW_RANGE_MIN + int(round((extra_sig + 1) / 2 * (BUZZSAW_RANGE_MAX - BUZZSAW_RANGE_MIN)))
+                tile["range"] = max(BUZZSAW_RANGE_MIN, min(BUZZSAW_RANGE_MAX, rng))
+            elif tile_type == TILE_COIN:
+                self._assign_coin_trap(tile, extra_sig, occupied)
+
             occupied.add((x, y))
-            tiles.append({"x": x, "y": y, "type": OBJECT_TYPES[type_idx]})
+            tiles.append(tile)
+
+        self._apply_level_devil_flavor(tiles, occupied, travel_dir)
 
         level = {
             "version": "1.0",
@@ -152,9 +223,57 @@ class BuilderEnv(gym.Env):
             "height": self.height,
             "target_deaths": self.target_difficulty,
             "cycle": self.cycle,
+            "goal_flees": goal_flees,
+            "goal_flee_chance": round(goal_flee_chance, 3),
             "tiles": tiles,
         }
         return level
+
+    def _assign_coin_trap(self, coin_tile: dict, extra_sig: float, occupied: set[tuple[int, int]]) -> None:
+        """Waehlt ueber das 'extra'-Aktionsfeld eine von 4 Richtungen fuer
+        die versteckte Falle, die der Coin beim Einsammeln ausloest (siehe
+        game_engine._handle_tile_interactions). Passt die Richtung nicht
+        ins Level, wird sie einfach weggelassen (kein Trap) -- der Coin
+        bleibt dann ein harmloses Sammelobjekt statt Koeder."""
+        directions = [(2, 0), (-2, 0), (0, -2), (0, 2)]
+        idx = min(len(directions) - 1, int((extra_sig + 1) / 2 * len(directions)))
+        dx, dy = directions[idx]
+        tx, ty = coin_tile["x"] + dx, coin_tile["y"] + dy
+        if 0 <= tx < self.width and 0 <= ty < self.height - 1 and (tx, ty) not in occupied:
+            coin_tile["trap_x"] = tx
+            coin_tile["trap_y"] = ty
+
+    def _apply_level_devil_flavor(self, tiles: list[dict], occupied: set[tuple[int, int]], travel_dir: int) -> None:
+        """Hand-autorierte Konstruktionsschicht, siehe Moduldocstring.
+        Mutiert `tiles` und `occupied` in-place."""
+        goal_tile = next((t for t in tiles if t["type"] == TILE_GOAL), None)
+
+        for tile in list(tiles):
+            # 1) Bounce-Pad -> mit Wahrscheinlichkeit ein Trap dahinter
+            if tile["type"] == TILE_BOUNCE and random.random() < BOUNCE_INTO_TRAP_CHANCE:
+                tx = tile["x"] + travel_dir * 2
+                ty = tile["y"]
+                if 0 <= tx < self.width and (tx, ty) not in occupied:
+                    occupied.add((tx, ty))
+                    tiles.append({"x": tx, "y": ty, "type": TILE_TRAP})
+
+            # 2) Solide/Plattform-Tiles nahe am Ziel -> manchmal Fake-Floor
+            elif (
+                goal_tile is not None
+                and tile["type"] in (TILE_SOLID, TILE_PLATFORM)
+                and abs(tile["x"] - goal_tile["x"]) + abs(tile["y"] - goal_tile["y"]) <= FAKE_FLOOR_NEAR_GOAL_RADIUS
+                and random.random() < FAKE_FLOOR_NEAR_GOAL_CHANCE
+            ):
+                tile["type"] = TILE_FAKE_FLOOR
+
+            # 3) Jeder Coin OHNE bereits zugewiesene Falle bekommt eine
+            #    garantierte (Coins sind grundsaetzlich Koeder, siehe Docstring)
+            elif tile["type"] == TILE_COIN and "trap_x" not in tile:
+                for dx, dy in ((2, 0), (-2, 0), (0, -2), (0, 2)):
+                    tx, ty = tile["x"] + dx, tile["y"] + dy
+                    if 0 <= tx < self.width and 0 <= ty < self.height - 1 and (tx, ty) not in occupied:
+                        tile["trap_x"], tile["trap_y"] = tx, ty
+                        break
 
     def step(self, action: np.ndarray):
         level = self._decode_level(np.asarray(action, dtype=np.float32))
