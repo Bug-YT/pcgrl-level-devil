@@ -53,6 +53,35 @@ def _apply_learning_rate(model, learning_rate: float) -> None:
     model.lr_schedule = get_schedule_fn(learning_rate)
 
 
+def make_builder_collector(builder_env: BuilderEnv):
+    """SB3-Callback, der waehrend builder_model.learn() JEDEN einzelnen
+    Env-Schritt mitschneidet (info-Dict + ein Snapshot des zu diesem
+    Zeitpunkt generierten Levels). Noetig, weil PPO aus Stable-Baselines3
+    batch_size > 1 verlangt (https://github.com/DLR-RM/stable-baselines3/issues/440),
+    der Builder-Env aber nur 1 Env hat -- also muss n_steps (und damit
+    batch_size) mindestens 2 sein. Das heisst: EIN learn()-Aufruf generiert
+    und spielt intern mehrere Level auf einmal ("Batch"), nicht nur eins.
+    Ohne diesen Collector wuerde die Pipeline nur das LETZTE Level dieses
+    Batches sehen und alle anderen (samt ihrem Feedback) stillschweigend
+    verlieren."""
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class _BuilderCollector(BaseCallback):
+        def __init__(self):
+            super().__init__()
+            self.entries: list[tuple[dict, dict]] = []
+
+        def _on_step(self) -> bool:
+            infos = self.locals.get("infos")
+            if infos:
+                # last_level wurde JETZT (in diesem Schritt) von builder_env.step()
+                # gesetzt -- als Snapshot sichern, bevor der naechste Schritt ihn ueberschreibt.
+                self.entries.append((infos[0], builder_env.last_level))
+            return True
+
+    return _BuilderCollector()
+
+
 class GuiQuit(Exception):
     """Wird ausgeloest, wenn das GUI-Fenster geschlossen (oder ESC gedrueckt)
     wurde. Wird im Hauptloop wie STRG+C behandelt: sauberer Shutdown mit
@@ -201,6 +230,7 @@ def evaluate_level(
                         from gui import decode_obs_position
 
                         x, y = decode_obs_position(obs[0], level)
+                        dynamic_state = infos[0].get("engine_diff") if infos else None
                         info_lines = [
                             f"Cycle: {cycle}",
                             f"Runde: {round_num}/{cfg.max_rounds_per_level}",
@@ -209,7 +239,7 @@ def evaluate_level(
                             "",
                             f"Evaluiert: {len(completed)}/{cfg.eval_runs} Runs abgeschlossen",
                         ]
-                        gui.render(level, player_pos=(x, y), info_lines=info_lines, phase="PLAYER EVALUATION")
+                        gui.render(level, player_pos=(x, y), info_lines=info_lines, phase="PLAYER EVALUATION", dynamic_state=dynamic_state)
                     if gui.want_quit:
                         raise GuiQuit()
 
@@ -348,7 +378,14 @@ def main() -> None:
         play_and_score_fn=play_and_score_fn,
     )
 
-    # Builder-PPO: Episodenlaenge = 1 (one-shot Levelgenerierung) -> n_steps=1
+    # Builder-PPO: Episodenlaenge = 1 (one-shot Levelgenerierung). Da nur
+    # 1 Env genutzt wird, verlangt SB3 trotzdem n_steps (= batch_size) >= 2
+    # (siehe https://github.com/DLR-RM/stable-baselines3/issues/440) --
+    # ein learn()-Aufruf generiert deshalb IMMER mindestens 2 Level auf
+    # einmal (siehe make_builder_collector oben), auch wenn N_BUILDER_STEPS=1
+    # gesetzt ist.
+    builder_n_steps = max(2, cfg.n_builder_steps)
+
     if builder_path.exists():
         builder_model = PPO.load(str(builder_path), env=builder_env, device=device_str)
         _apply_learning_rate(builder_model, cfg.builder_learning_rate)
@@ -358,8 +395,8 @@ def main() -> None:
             "MlpPolicy",
             builder_env,
             device=device_str,
-            n_steps=max(1, cfg.n_builder_steps),
-            batch_size=max(1, cfg.n_builder_steps),
+            n_steps=builder_n_steps,
+            batch_size=builder_n_steps,
             n_epochs=4,
             learning_rate=cfg.builder_learning_rate,
             verbose=cfg.ppo_verbose,
@@ -394,104 +431,107 @@ def main() -> None:
     cycle = 0
     try:
         while True:  # kein Early Stop
-            cycle += 1
-            print(f"\n===== CYCLE {cycle} =====")
-
             last_ema = tracker.ema
-            print(f"[1. READ] Target deaths: {cfg.target_difficulty} | Last winrate: {last_ema['winrate']:.2f}")
-            builder_env.update_context(last_ema, cycle)
+            builder_env.update_context(last_ema, cycle + 1)
 
-            print("[2. GEN] Builder PPO generiert neues Level ...")
+            print(f"\n[BATCH] Builder generiert {builder_n_steps} Level(e) (SB3 verlangt n_steps >= 2) ...")
+            collector = make_builder_collector(builder_env)
             # Ein einziger learn()-Aufruf uebernimmt sowohl das Sampeln der
-            # Aktion (-> Level) als auch das Policy-Update mit dem daraus
-            # resultierenden Reward -- kein separater manueller step()-Call
-            # mehr noetig (der wuerde sonst ein zweites, ungenutztes Level
-            # erzeugen und unnoetig ein zweites Mal den Player trainieren).
-            builder_model.learn(total_timesteps=max(1, cfg.n_builder_steps), reset_num_timesteps=False)
-            info = builder_env.last_info
+            # Aktionen (-> Level) als auch das Policy-Update mit den daraus
+            # resultierenden Rewards -- kein separater manueller step()-Call
+            # mehr noetig (der wuerde sonst zusaetzliche, ungenutzte Level
+            # erzeugen und unnoetig oft den Player trainieren). Der Collector
+            # sammelt dabei JEDES im Batch generierte Level einzeln ein.
+            builder_model.learn(total_timesteps=builder_n_steps, reset_num_timesteps=False, callback=collector)
 
-            level_path = info.get("level_path")
-            print(f"[3. EXPORT] -> {level_path}")
+            for info, level_snapshot in collector.entries:
+                cycle += 1
+                print(f"\n===== CYCLE {cycle} =====")
+                print(f"[1. READ] Target deaths: {cfg.target_difficulty} | Last winrate: {last_ema['winrate']:.2f}")
+                print("[2. GEN] Builder PPO hat Level generiert")
 
-            if not info["lint_ok"]:
-                print(f"[4. LINT FAIL] {info['errors']}")
-                stats.record_lint_fail()
+                level_path = info.get("level_path")
+                print(f"[3. EXPORT] -> {level_path}")
+
+                if not info["lint_ok"]:
+                    print(f"[4. LINT FAIL] {info['errors']}")
+                    stats.record_lint_fail()
+                    stats.save(stats_path)
+                    append_history(cfg, {
+                        "cycle": cycle,
+                        "timestamp": datetime.now().isoformat(),
+                        "level_file": level_path,
+                        "lint_ok": False,
+                        "errors": info["errors"],
+                    })
+                    if gui is not None:
+                        gui.render(
+                            level_snapshot,
+                            player_pos=None,
+                            info_lines=[f"Cycle: {cycle}", "LINT FEHLGESCHLAGEN:"] + [f"- {e}" for e in info["errors"][:6]],
+                            phase="BUILDER: LEVEL VERWORFEN",
+                        )
+                    cooldown(
+                        cfg.cooldown_seconds,
+                        gui=gui,
+                        level=level_snapshot,
+                        info_lines=[f"Cycle: {cycle}", "Level verworfen (Lint-Fehler)"],
+                    )
+                    continue
+
+                print("[4. LINT OK]")
+                print("[5. LOAD] Level geladen -- trainiere bis geschafft oder aufgegeben")
+
+                feedback_raw = info["feedback"]
+                status = "GESCHAFFT" if feedback_raw["beaten"] else "AUFGEGEBEN"
+                print(
+                    f"[6. PLAY] {status} nach {feedback_raw['rounds_used']} Runde(n). "
+                    f"Winrate: {feedback_raw['winrate']:.2f} | Deaths: {feedback_raw['avg_deaths']:.1f}"
+                )
+
+                ema = tracker.update(feedback_raw, cycle, level_path)
+                print(
+                    f"[7. FEEDBACK] Score: {feedback_raw['score']:.2f} | "
+                    f"Best: {tracker.best_score:.2f} @c{tracker.best_cycle} | "
+                    f"AvgDeaths: {ema['avg_deaths']:.2f}"
+                )
+
+                stats.record_level_result(
+                    cycle, level_path, feedback_raw,
+                    rounds_used=feedback_raw["rounds_used"],
+                    player_steps_used=feedback_raw["rounds_used"] * cfg.n_player_steps,
+                )
                 stats.save(stats_path)
+                print("      --- Statistik ---")
+                for line in stats.summary_lines():
+                    print(f"      {line}")
+
                 append_history(cfg, {
                     "cycle": cycle,
                     "timestamp": datetime.now().isoformat(),
                     "level_file": level_path,
-                    "lint_ok": False,
-                    "errors": info["errors"],
+                    "lint_ok": True,
+                    "feedback_raw": feedback_raw,
+                    "feedback_ema": ema,
+                    "best_score": tracker.best_score,
+                    "best_cycle": tracker.best_cycle,
                 })
-                if gui is not None:
-                    gui.render(
-                        builder_env.last_level,
-                        player_pos=None,
-                        info_lines=[f"Cycle: {cycle}", "LINT FEHLGESCHLAGEN:"] + [f"- {e}" for e in info["errors"][:6]],
-                        phase="BUILDER: LEVEL VERWORFEN",
-                    )
+
+                models_dir.mkdir(parents=True, exist_ok=True)
+                builder_model.save(str(builder_path))
+                player_model.save(str(player_path))
+
                 cooldown(
                     cfg.cooldown_seconds,
                     gui=gui,
-                    level=builder_env.last_level,
-                    info_lines=[f"Cycle: {cycle}", "Level verworfen (Lint-Fehler)"],
+                    level=level_snapshot,
+                    info_lines=[
+                        f"Cycle: {cycle} ({status})",
+                        f"Score: {feedback_raw['score']:.2f} | Best: {tracker.best_score:.2f} @c{tracker.best_cycle}",
+                        f"avg_deaths: {feedback_raw['avg_deaths']:.1f} (Ziel: {cfg.target_difficulty})",
+                        f"winrate: {feedback_raw['winrate']:.2f}",
+                    ],
                 )
-                continue
-
-            print("[4. LINT OK]")
-            print("[5. LOAD] Level geladen -- trainiere bis geschafft oder aufgegeben")
-
-            feedback_raw = info["feedback"]
-            status = "GESCHAFFT" if feedback_raw["beaten"] else "AUFGEGEBEN"
-            print(
-                f"[6. PLAY] {status} nach {feedback_raw['rounds_used']} Runde(n). "
-                f"Winrate: {feedback_raw['winrate']:.2f} | Deaths: {feedback_raw['avg_deaths']:.1f}"
-            )
-
-            ema = tracker.update(feedback_raw, cycle, level_path)
-            print(
-                f"[7. FEEDBACK] Score: {feedback_raw['score']:.2f} | "
-                f"Best: {tracker.best_score:.2f} @c{tracker.best_cycle} | "
-                f"AvgDeaths: {ema['avg_deaths']:.2f}"
-            )
-
-            stats.record_level_result(
-                cycle, level_path, feedback_raw,
-                rounds_used=feedback_raw["rounds_used"],
-                player_steps_used=feedback_raw["rounds_used"] * cfg.n_player_steps,
-            )
-            stats.save(stats_path)
-            print("      --- Statistik ---")
-            for line in stats.summary_lines():
-                print(f"      {line}")
-
-            append_history(cfg, {
-                "cycle": cycle,
-                "timestamp": datetime.now().isoformat(),
-                "level_file": level_path,
-                "lint_ok": True,
-                "feedback_raw": feedback_raw,
-                "feedback_ema": ema,
-                "best_score": tracker.best_score,
-                "best_cycle": tracker.best_cycle,
-            })
-
-            models_dir.mkdir(parents=True, exist_ok=True)
-            builder_model.save(str(builder_path))
-            player_model.save(str(player_path))
-
-            cooldown(
-                cfg.cooldown_seconds,
-                gui=gui,
-                level=builder_env.last_level,
-                info_lines=[
-                    f"Cycle: {cycle} ({status})",
-                    f"Score: {feedback_raw['score']:.2f} | Best: {tracker.best_score:.2f} @c{tracker.best_cycle}",
-                    f"avg_deaths: {feedback_raw['avg_deaths']:.1f} (Ziel: {cfg.target_difficulty})",
-                    f"winrate: {feedback_raw['winrate']:.2f}",
-                ],
-            )
 
     except (KeyboardInterrupt, GuiQuit) as e:
         reason = "STRG+C erkannt" if isinstance(e, KeyboardInterrupt) else "GUI-Fenster geschlossen"
