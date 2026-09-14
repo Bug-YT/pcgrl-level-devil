@@ -48,7 +48,7 @@ class Config:
     n_envs: int = 4
     device: str = "auto"
 
-    n_builder_steps: int = 1
+    n_builder_steps: int = 2  # SB3 verlangt batch_size > 1; Pipeline erzwingt ohnehin max(2, ...)
     n_player_steps: int = 2048
 
     max_objects: int = 6
@@ -113,7 +113,7 @@ def load_config(env_path: str = ".env", argv: list[str] | None = None) -> Config
         models_folder=os.getenv("MODELS_FOLDER", "models"),
         n_envs=int(os.getenv("N_ENVS", 4)),
         device=os.getenv("DEVICE", "auto"),
-        n_builder_steps=int(os.getenv("N_BUILDER_STEPS", 1)),
+        n_builder_steps=int(os.getenv("N_BUILDER_STEPS", 2)),
         n_player_steps=int(os.getenv("N_PLAYER_STEPS", 2048)),
         max_objects=int(os.getenv("MAX_OBJECTS", os.getenv("MAX_TRAPS", 6))),
         eval_runs=int(os.getenv("EVAL_RUNS", 4)),
